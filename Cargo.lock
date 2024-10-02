@@ -272,7 +272,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "reverse-proxy"
+name = "rnginx"
 version = "0.1.0"
 dependencies = [
  "futures",
