@@ -1,11 +1,14 @@
 use std::{
+    collections::HashMap,
     fs::File,
     io::{BufRead, BufReader},
     path::PathBuf,
+    sync::Arc,
 };
 
 use clap::Parser;
 use futures::future::join_all;
+
 use tokio::{
     net::{TcpListener, TcpStream},
     time::Instant,
@@ -14,40 +17,43 @@ use tokio::{
 const LOCALHOST: &str = "127.0.0.1";
 const DELIMITER: &str = "->";
 
-struct Proxy {
-    from: u16,
-    to: u16,
-}
-
-impl Proxy {
-    fn new(from: u16, to: u16) -> Self {
-        Self { from, to }
-    }
-}
-
-async fn redirect(mut socket: TcpStream, from: u16, to: u16) -> tokio::io::Result<()> {
+async fn redirect(mut socket: TcpStream, from: u16, to: Arc<[u16]>) -> tokio::io::Result<()> {
     let instant = Instant::now();
 
-    let mut client = TcpStream::connect((LOCALHOST, to)).await.map_err(|err| {
-        eprintln!(":{} is off.", to);
-        err
-    })?;
+    let streams: Vec<_> = to
+        .iter()
+        .map(|to| (to, TcpStream::connect((LOCALHOST, *to))))
+        .collect();
 
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut socket).await;
+    for (to, stream) in streams {
+        let mut client = match stream.await {
+            Ok(client) => client,
+            Err(err) => {
+                println!(":{from} -> :{to} failed: {err}");
+                continue;
+            }
+        };
 
-    let elapsed = instant.elapsed();
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut socket).await;
 
-    println!(":{from} -> :{to} in {elapsed:?}");
+        let elapsed = instant.elapsed();
+
+        println!(":{from} -> :{to} in {elapsed:?}");
+
+        break;
+    }
 
     Ok(())
 }
 
-async fn accept_loop(proxy: Proxy) -> tokio::io::Result<()> {
-    let listener = TcpListener::bind((LOCALHOST, proxy.from)).await?;
+async fn accept_loop(from: u16, to: Vec<u16>) -> tokio::io::Result<()> {
+    let listener = TcpListener::bind((LOCALHOST, from)).await?;
+
+    let to: Arc<[u16]> = to.into();
 
     loop {
         if let Ok((socket, _)) = listener.accept().await {
-            tokio::spawn(redirect(socket, proxy.from, proxy.to));
+            tokio::spawn(redirect(socket, from, to.clone()));
         }
     }
 }
@@ -69,16 +75,27 @@ async fn main() -> tokio::io::Result<()> {
 
     let file = File::open(file_name)?;
 
-    let proxis = BufReader::new(file)
+    let mut proxy_table: HashMap<u16, Vec<u16>> = HashMap::new();
+
+    for (from, to) in BufReader::new(file)
         .lines()
         .map_while(Result::ok)
         .flat_map(|line| {
-            let (from, to) = line.split_once(DELIMITER)?;
-            let from = from.trim().parse().ok()?;
-            let to = to.trim().parse().ok()?;
-            Some(Proxy::new(from, to))
+            let (from, to) = line.trim().split_once(DELIMITER)?;
+            let from = from.trim_end().parse().ok()?;
+            let to = to.trim_start().parse().ok()?;
+            Some((from, to))
         })
-        .map(|proxy| tokio::spawn(accept_loop(proxy)));
+    {
+        proxy_table
+            .entry(from)
+            .and_modify(|v| v.push(to))
+            .or_insert(vec![to]);
+    }
+
+    let proxis = proxy_table
+        .into_iter()
+        .map(|(from, to)| tokio::spawn(accept_loop(from, to)));
 
     let _ = join_all(proxis).await;
 
